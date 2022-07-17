@@ -18,6 +18,9 @@
 import sigrokdecode as srd
 import crc
 
+ann_temperature, ann_relative_humidity, ann_command, ann_text_verbose, ann_text, ann_warning = range(
+    6)
+
 
 class Decoder(srd.Decoder):
     api_version = 3
@@ -32,8 +35,9 @@ class Decoder(srd.Decoder):
     options = (
     )
     annotations = (
-        ('celsius', 'Temperature / °C'),
+        ('temperature', 'Temperature / °C'),
         ('relative-humidity', 'Relative Humidity / %'),
+        ('command', 'Command'),
         ('text-verbose', 'Text (verbose)'),
         ('text', 'Text'),
         ('warning', 'Warning'),
@@ -74,28 +78,36 @@ class Decoder(srd.Decoder):
         # SHT31 devices have a 7-bit I²C slave address either 0x44 or 0x45 (depending on whether ADDR pin is pulled high or low).
         if addr not in range(0x44, 0x45 + 1):
             s = 'Warning: I²C slave address 0x%02x not an SHT31 sensor.'
-            self.putx([4, [s % addr]])
+            self.putx([ann_warning, [s % addr]])
 
     def warn_upon_crc_error(self, data, expected_crc):
         crc = self.crc_calculator.calculate_checksum(data)
         if self.crc_calculator.verify_checksum(data, expected_crc):
             s = 'CRC: %02X'
-            self.putx([3, [s % crc]])
+            self.putx([ann_text, [s % crc]])
         else:
             s = 'Warning: CRC: %02X'
-            self.putx([4, [s % crc]])
+            self.putx([ann_warning, [s % crc]])
 
     def output_temperature(self):
         raw = (self.databytes[0] << 8) | self.databytes[1]
         celsius = -45 + 175 * float(raw) / (2**16 - 1)
-        self.putb([0, ['%s: %.1f °C' % ('Temperature', celsius)]])
+        self.putb([ann_temperature, ['%s: %.1f °C' %
+                  ('Temperature', celsius)]])
 
     def output_relative_humidity(self):
         raw = (self.databytes[2] << 8) | self.databytes[3]
         relative_humidity = 100 * float(raw) / (2**16 - 1)
-        self.putb([1, ['%s: %.1f %%' % ('Relative Humidity', relative_humidity)]])
+        self.putb([ann_relative_humidity, ['%s: %.1f %%' %
+                  ('Relative Humidity', relative_humidity)]])
 
-    def handle_periodic_data(self, b, rw):
+    def output_command(self):
+        if (self.databytes[0] in [0x24, 0x2C]):
+            clock_stretching = self.databytes[0] == 0x2C
+            self.putb([ann_command, ['Start single shot measurement: clock stretching %s' %
+                      ('enabled' if clock_stretching else 'disabled')]])
+
+    def handle_read_data(self, b):
         self.databytes.append(b)
         if len(self.databytes) == 1 or len(self.databytes) == 4:
             self.ss_block = self.ss
@@ -119,6 +131,17 @@ class Decoder(srd.Decoder):
             self.databytes = []
             return
 
+    def handle_write_command(self, b):
+        self.databytes.append(b)
+        if len(self.databytes) == 1:
+            self.ss_block = self.ss
+            return
+        if len(self.databytes) == 2:
+            self.es_block = self.es
+            self.output_command()
+            self.databytes = []
+            return
+
     def decode(self, ss, es, data):
         cmd, databyte = data
 
@@ -135,10 +158,23 @@ class Decoder(srd.Decoder):
             # Wait for an address read/write operation.
             if cmd == 'ADDRESS READ':
                 self.warn_upon_invalid_slave(databyte)
-                self.state = 'READ PERIODIC DATA'
-        elif self.state == 'READ PERIODIC DATA':
+                self.state = 'READ DATA'
+            elif cmd == 'ADDRESS WRITE':
+                self.warn_upon_invalid_slave(databyte)
+                self.state = 'WRITE COMMAND'
+        elif self.state == 'READ DATA':
             if cmd == 'DATA READ':
-                self.handle_periodic_data(databyte, cmd[5:])
+                self.handle_read_data(databyte)
+            elif cmd == 'STOP':
+                self.state = 'IDLE'
+            else:
+                # self.putx([0, ['Ignoring: %s (data=%s)' % (cmd, databyte)]])
+                pass
+        elif self.state == 'WRITE COMMAND':
+            if cmd == 'DATA WRITE':
+                self.handle_write_command(databyte)
+            elif cmd == 'START REPEAT':
+                self.state = 'GET SLAVE ADDR'
             elif cmd == 'STOP':
                 self.state = 'IDLE'
             else:
